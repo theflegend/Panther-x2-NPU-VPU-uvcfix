@@ -1,0 +1,32 @@
+#!/bin/sh
+
+# Panther X2 has one physical Ethernet port. Use it as LAN while obtaining
+# the management address from an upstream DHCP server.
+
+uci -q delete network.wan || true
+uci -q delete network.wan6 || true
+
+# Remove the default br-lan device so it cannot keep eth0 enslaved after the
+# LAN interface is changed to use the physical port directly.
+uci -q show network |
+	sed -n 's/^\(network\.[^=]*\)=device$/\1/p' |
+	while IFS= read -r section; do
+		[ "$(uci -q get "${section}.name")" = 'br-lan' ] || continue
+		uci -q delete "${section}" || true
+	done
+
+uci -q delete network.lan || true
+uci set network.lan='interface'
+uci set network.lan.device='eth0'
+uci set network.lan.proto='dhcp'
+uci commit network
+
+uci -q get dhcp.lan >/dev/null 2>&1 || uci set dhcp.lan='dhcp'
+uci set dhcp.lan.interface='lan'
+uci set dhcp.lan.ignore='1'
+uci set dhcp.lan.ra='disabled'
+uci set dhcp.lan.dhcpv6='disabled'
+uci set dhcp.lan.ndp='disabled'
+uci commit dhcp
+
+exit 0

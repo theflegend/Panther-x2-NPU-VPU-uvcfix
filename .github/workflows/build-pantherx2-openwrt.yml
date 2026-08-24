@@ -1,0 +1,433 @@
+name: Build Panther X2 OpenWrt BSP 6.1
+
+on:
+  push:
+    branches:
+      - test/openwrt-*
+  workflow_dispatch:
+    inputs:
+      rootfs_flavor:
+        description: Select the ophub ARMv8 OpenWrt rootfs
+        required: true
+        default: immortalwrt_master
+        type: choice
+        options:
+          - immortalwrt_master
+          - openwrt_main
+          - lede_master
+      rootfs_url:
+        description: Optional direct rootfs.tar.gz URL; overrides rootfs_flavor
+        required: false
+        default: ""
+        type: string
+      image_size:
+        description: BOOT/ROOT partition sizes in MiB
+        required: true
+        default: 384/1536
+        type: string
+      publish_release:
+        description: Publish the verified image to a GitHub Release
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: pantherx2-openwrt-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  ARMBIAN_COMMIT: 70a242faa308c57be5ed636897dfee77de350773
+  OPHUB_OPENWRT_COMMIT: bcb012ed6d7631957321eecdcadea4e2518bef6a
+  OPHUB_ARMBIAN_RESOURCE_COMMIT: d0a151759288de3341c7d8fc2a559556765947d0
+  OPHUB_UBOOT_RESOURCE_COMMIT: 4c83fe57ba50bf92548f112d5e93b4a353c6d6be
+  OPHUB_FIRMWARE_RESOURCE_COMMIT: 010dca400d09c11450a06d42a2adc7714e78c862
+  OPHUB_LUCI_RESOURCE_COMMIT: 8fe2b60b4d63e2d83fbe5eb12c37c77a892c0117
+  KERNEL_BASE: 6.1.115
+  KERNEL_RELEASE: 6.1.115-vendor-rk35xx
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    name: Panther X2 / OpenWrt / BSP 6.1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout firmware configuration
+        uses: actions/checkout@v6
+
+      - name: Audit local build inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s armbian/config/boards/panther-x2-vendor.csc
+          test -s armbian/userpatches/config-pantherx2-openwrt-kernel.conf
+          test -s armbian/userpatches/extensions/pantherx2-openwrt-kernel.sh
+          test -s armbian/userpatches/kernel/rk35xx-vendor-6.1/0001-arm64-dts-rockchip-add-panther-x2-bsp61-accel.patch
+          test -s armbian/userpatches/u-boot/u-boot-panther-x2-radxa/9999-fix-radxa-rock3-gcc-compat.patch
+          test -x openwrt/files/etc/uci-defaults/99-pantherx2-single-lan
+          test -x scripts/package-openwrt-bsp.sh
+          test -x scripts/validate-openwrt-image.sh
+
+          grep -q '^BOARD=panther-x2-vendor$' armbian/userpatches/config-pantherx2-openwrt-kernel.conf
+          grep -q '^BRANCH=vendor$' armbian/userpatches/config-pantherx2-openwrt-kernel.conf
+          grep -q '^ENABLE_EXTENSIONS="pantherx2-openwrt-kernel"$' armbian/userpatches/config-pantherx2-openwrt-kernel.conf
+          # shellcheck disable=SC2016
+          grep -qF 'opts_m=("${kept_opts_m[@]}")' armbian/userpatches/extensions/pantherx2-openwrt-kernel.sh
+          grep -qF 'opts_y+=("BTRFS_FS")' armbian/userpatches/extensions/pantherx2-openwrt-kernel.sh
+          grep -q 'KERNELBRANCH="commit:5280f9b4336199c4025c8eed894d2b4e2268dcc6"' armbian/config/boards/panther-x2-vendor.csc
+          grep -q 'BOOTBRANCH="commit:c55987146f4f9b20f7cb2f917ca88300419afe8d"' armbian/config/boards/panther-x2-vendor.csc
+          grep -q 'interrupt-names = "npu_irq"' armbian/userpatches/kernel/rk35xx-vendor-6.1/0001-arm64-dts-rockchip-add-panther-x2-bsp61-accel.patch
+          grep -q 'dr_mode = "host"' armbian/userpatches/kernel/rk35xx-vendor-6.1/0001-arm64-dts-rockchip-add-panther-x2-bsp61-accel.patch
+          grep -q "uci set network.lan.device='eth0'" openwrt/files/etc/uci-defaults/99-pantherx2-single-lan
+          grep -q "uci set network.lan.proto='dhcp'" openwrt/files/etc/uci-defaults/99-pantherx2-single-lan
+          grep -q "uci set dhcp.lan.ignore='1'" openwrt/files/etc/uci-defaults/99-pantherx2-single-lan
+
+      - name: Reclaim runner disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker image prune --all --force || true
+          if [[ -n "${AGENT_TOOLSDIRECTORY:-}" ]]; then
+            sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
+          fi
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get clean
+          df -hT
+
+      - name: Install image packaging tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install --yes \
+            btrfs-progs \
+            cpio \
+            device-tree-compiler \
+            dosfstools \
+            e2fsprogs \
+            fdisk \
+            jq \
+            parted \
+            pigz \
+            rsync \
+            u-boot-tools \
+            util-linux \
+            xz-utils
+
+      - name: Fetch pinned Armbian build framework
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo mkdir -p /builder
+          sudo chown "$(id -u):$(id -g)" /builder
+
+          git init /builder/build
+          git -C /builder/build remote add origin https://github.com/armbian/build.git
+          git -C /builder/build fetch --depth=1 origin "${ARMBIAN_COMMIT}"
+          git -C /builder/build checkout --detach FETCH_HEAD
+          test "$(git -C /builder/build rev-parse HEAD)" = "${ARMBIAN_COMMIT}"
+
+          rsync -a "${GITHUB_WORKSPACE}/armbian/" /builder/build/
+          git -C /builder/build status --short
+
+      - name: Build the current BSP kernel and U-Boot
+        working-directory: /builder/build
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ./compile.sh \
+            pantherx2-openwrt-kernel \
+            kernel \
+            ARTIFACT_IGNORE_CACHE=yes
+
+          mapfile -t kernel_debs < <(find output/debs -type f \
+            -name 'linux-image-vendor-rk35xx*.deb' -print | sort)
+          [[ "${#kernel_debs[@]}" -eq 1 ]] || {
+            printf 'Expected one kernel image DEB, found %s\n' "${#kernel_debs[@]}" >&2
+            printf '  %s\n' "${kernel_debs[@]:-<none>}" >&2
+            exit 1
+          }
+          kernel_check="$(mktemp -d)"
+          # Expand kernel_check when the trap runs.
+          # shellcheck disable=SC2016
+          trap 'rm -rf -- "${kernel_check}"' EXIT
+          dpkg-deb -x "${kernel_debs[0]}" "${kernel_check}"
+          kernel_config="$(find "${kernel_check}/boot" -maxdepth 1 \
+            -type f -name 'config-*' -print -quit)"
+          test -s "${kernel_config}"
+          grep -q '^CONFIG_BTRFS_FS=y$' "${kernel_config}" || {
+            grep '^CONFIG_BTRFS_FS=' "${kernel_config}" >&2 || true
+            echo 'OpenWrt requires CONFIG_BTRFS_FS=y in the built kernel package' >&2
+            exit 1
+          }
+          echo 'Verified built kernel package: CONFIG_BTRFS_FS=y'
+
+          ./compile.sh \
+            pantherx2-image \
+            uboot \
+            ARTIFACT_IGNORE_CACHE=yes
+
+          find output/debs -type f \
+            \( -name 'linux-image-vendor-rk35xx*.deb' \
+               -o -name 'linux-dtb-vendor-rk35xx*.deb' \
+               -o -name 'linux-u-boot-panther-x2-vendor-vendor*.deb' \) \
+            -printf '%P\n' | sort
+
+      - name: Fetch pinned ophub packaging resources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          fetch_commit() {
+            local url="$1"
+            local commit="$2"
+            local destination="$3"
+            local create_main="${4:-no}"
+
+            git init "${destination}"
+            git -C "${destination}" remote add origin "${url}"
+            git -C "${destination}" fetch --depth=1 origin "${commit}"
+            git -C "${destination}" checkout --detach FETCH_HEAD
+            test "$(git -C "${destination}" rev-parse HEAD)" = "${commit}"
+            if [[ "${create_main}" == "yes" ]]; then
+              git -C "${destination}" branch --force main "${commit}"
+            fi
+          }
+
+          fetch_commit \
+            https://github.com/ophub/amlogic-s9xxx-openwrt.git \
+            "${OPHUB_OPENWRT_COMMIT}" \
+            /builder/ophub-openwrt
+          fetch_commit \
+            https://github.com/ophub/amlogic-s9xxx-armbian.git \
+            "${OPHUB_ARMBIAN_RESOURCE_COMMIT}" \
+            /builder/ophub-armbian-resource \
+            yes
+          fetch_commit \
+            https://github.com/ophub/u-boot.git \
+            "${OPHUB_UBOOT_RESOURCE_COMMIT}" \
+            /builder/ophub-uboot-resource
+          fetch_commit \
+            https://github.com/ophub/firmware.git \
+            "${OPHUB_FIRMWARE_RESOURCE_COMMIT}" \
+            /builder/ophub-firmware-resource \
+            yes
+          fetch_commit \
+            https://github.com/ophub/luci-app-amlogic.git \
+            "${OPHUB_LUCI_RESOURCE_COMMIT}" \
+            /builder/ophub-luci-resource \
+            yes
+
+          rsync -a \
+            /builder/ophub-uboot-resource/u-boot/ \
+            /builder/ophub-openwrt/make-openwrt/u-boot/
+          rsync -a \
+            "${GITHUB_WORKSPACE}/openwrt/files/" \
+            /builder/ophub-openwrt/make-openwrt/openwrt-files/common-files/
+
+          sed -i \
+            -e 's#^depends_repo=.*#depends_repo="file:///builder/ophub-armbian-resource"#' \
+            -e 's#^firmware_repo=.*#firmware_repo="file:///builder/ophub-firmware-resource"#' \
+            -e 's#^script_repo=.*#script_repo="file:///builder/ophub-luci-resource"#' \
+            /builder/ophub-openwrt/remake
+
+          grep -q '^depends_repo="file:///builder/ophub-armbian-resource"$' /builder/ophub-openwrt/remake
+          grep -q '^firmware_repo="file:///builder/ophub-firmware-resource"$' /builder/ophub-openwrt/remake
+          grep -q '^script_repo="file:///builder/ophub-luci-resource"$' /builder/ophub-openwrt/remake
+
+      - name: Download the ophub ARMv8 OpenWrt rootfs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ROOTFS_FLAVOR: ${{ inputs.rootfs_flavor || 'immortalwrt_master' }}
+          ROOTFS_URL: ${{ inputs.rootfs_url || '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rootfs_dir=/builder/ophub-openwrt/openwrt-armsr
+          rootfs_file="${rootfs_dir}/openwrt-armsr-armv8-generic-rootfs.tar.gz"
+          mkdir -p "${rootfs_dir}"
+
+          if [[ -n "${ROOTFS_URL}" ]]; then
+            asset_url="${ROOTFS_URL}"
+            asset_name="custom URL"
+            release_tag="custom"
+            curl -fL --retry 3 "${asset_url}" -o "${rootfs_file}"
+          else
+            releases_json="$(curl -fsSL --retry 3 \
+              -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              'https://api.github.com/repos/ophub/amlogic-s9xxx-openwrt/releases?per_page=30')"
+            asset_json="$(jq -c \
+              --arg prefix "OpenWrt_${ROOTFS_FLAVOR}_" \
+              '([.[] | select(.tag_name | startswith($prefix)) |
+                 .assets[] | select(.name | endswith("-rootfs.tar.gz"))] |
+                 sort_by(.updated_at) | last) // empty' \
+              <<<"${releases_json}")"
+            [[ -n "${asset_json}" ]] || {
+              echo "No ${ROOTFS_FLAVOR} ARMv8 rootfs was found in ophub releases" >&2
+              exit 1
+            }
+
+            asset_url="$(jq -r '.url' <<<"${asset_json}")"
+            asset_name="$(jq -r '.name' <<<"${asset_json}")"
+            release_tag="$(jq -r '.browser_download_url' <<<"${asset_json}" | awk -F/ '{print $(NF-1)}')"
+            curl -fsSL --retry 3 \
+              -H 'Accept: application/octet-stream' \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "${asset_url}" \
+              -o "${rootfs_file}"
+          fi
+
+          test -s "${rootfs_file}"
+          tar -tzf "${rootfs_file}" > "${GITHUB_WORKSPACE}/openwrt-rootfs-files.txt"
+          grep -Eq '^(\./)?etc/openwrt_release$' "${GITHUB_WORKSPACE}/openwrt-rootfs-files.txt"
+          sha256sum "${rootfs_file}" | tee "${GITHUB_WORKSPACE}/openwrt-rootfs.sha256"
+          {
+            echo "ROOTFS_FLAVOR=${ROOTFS_FLAVOR}"
+            echo "RELEASE_TAG=${release_tag}"
+            echo "ASSET_NAME=${asset_name}"
+          } | tee "${GITHUB_WORKSPACE}/openwrt-rootfs-source.txt"
+
+      - name: Convert the BSP packages for ophub
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kernel_parent=/builder/ophub-openwrt/make-openwrt/kernel/rk35xx
+          kernel_output="${kernel_parent}/${KERNEL_BASE}"
+          uboot_output=/builder/ophub-openwrt/make-openwrt/u-boot/rockchip/panther-x2
+          mkdir -p "${kernel_parent}"
+
+          "${GITHUB_WORKSPACE}/scripts/package-openwrt-bsp.sh" \
+            --debs /builder/build/output/debs \
+            --kernel-output "${kernel_output}" \
+            --uboot-output "${uboot_output}" \
+            --expected-base "${KERNEL_BASE}" \
+            --manifest "${GITHUB_WORKSPACE}/pantherx2-bsp-manifest.txt"
+
+          model_database=/builder/ophub-openwrt/make-openwrt/openwrt-files/common-files/etc/model_database.conf
+          panther_line="$(grep -n ':Panther-X2' "${model_database}")"
+          [[ "${panther_line}" == *':stable/6.18.y'* ]] || {
+            echo "Pinned ophub Panther X2 model entry changed unexpectedly: ${panther_line}" >&2
+            exit 1
+          }
+          line_number="${panther_line%%:*}"
+          sed -i "${line_number}s#stable/6.18.y#rk35xx/6.1.y#" "${model_database}"
+          grep -n ':Panther-X2' "${model_database}" | grep -q ':rk35xx/6.1.y'
+
+          find "${kernel_output}" -maxdepth 1 -type f -printf '%f\n' | sort
+          find "${uboot_output}" -maxdepth 1 -type f -printf '%f\n' | sort
+
+      - name: Package the Panther X2 OpenWrt image
+        working-directory: /builder/ophub-openwrt
+        env:
+          IMAGE_SIZE: ${{ inputs.image_size || '384/1536' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ "${IMAGE_SIZE}" =~ ^[0-9]+/[0-9]+$ ]] || {
+            echo "Invalid image size: ${IMAGE_SIZE}" >&2
+            exit 1
+          }
+
+          sudo ./remake \
+            -b panther-x2 \
+            -k "${KERNEL_BASE}" \
+            -a false \
+            -s "${IMAGE_SIZE}" \
+            -n Panther-X2-BSP61 \
+            2>&1 | tee "${GITHUB_WORKSPACE}/pantherx2-openwrt-build.log"
+
+          sudo chown -R "$(id -u):$(id -g)" openwrt/out
+          mapfile -t images < <(find openwrt/out -maxdepth 1 -type f -name '*.img.gz' -print | sort)
+          [[ "${#images[@]}" -eq 1 ]] || {
+            printf 'Expected one OpenWrt image, found %s\n' "${#images[@]}" >&2
+            printf '  %s\n' "${images[@]:-<none>}" >&2
+            exit 1
+          }
+          echo "OPENWRT_IMAGE=${PWD}/${images[0]}" >> "${GITHUB_ENV}"
+
+      - name: Verify the generated OpenWrt firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          "${GITHUB_WORKSPACE}/scripts/validate-openwrt-image.sh" \
+            --image "${OPENWRT_IMAGE}" \
+            --kernel-release "${KERNEL_RELEASE}" \
+            --uboot-dir /builder/ophub-openwrt/make-openwrt/u-boot/rockchip/panther-x2 \
+            --report "${GITHUB_WORKSPACE}/pantherx2-openwrt-validation.txt"
+
+      - name: Generate image checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          image_dir="$(dirname "${OPENWRT_IMAGE}")"
+          image_name="$(basename "${OPENWRT_IMAGE}")"
+          cd "${image_dir}"
+          sha256sum "${image_name}" > "${image_name}.sha256"
+          sha256sum --check "${image_name}.sha256"
+          ls -lh "${image_name}" "${image_name}.sha256"
+
+      - name: Upload verified OpenWrt firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: Panther-X2-OpenWrt-BSP61-${{ github.run_number }}
+          path: |
+            /builder/ophub-openwrt/openwrt/out/*.img.gz
+            /builder/ophub-openwrt/openwrt/out/*.img.gz.sha256
+            pantherx2-bsp-manifest.txt
+            pantherx2-openwrt-validation.txt
+            openwrt-rootfs-source.txt
+            openwrt-rootfs.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Panther-X2-OpenWrt-logs-${{ github.run_number }}
+          path: |
+            /builder/build/output/logs/
+            pantherx2-openwrt-build.log
+            pantherx2-openwrt-validation.txt
+            pantherx2-bsp-manifest.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: success() && inputs.publish_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="pantherx2-openwrt-bsp61-${GITHUB_RUN_NUMBER}"
+          gh release create "${tag}" \
+            /builder/ophub-openwrt/openwrt/out/*.img.gz \
+            /builder/ophub-openwrt/openwrt/out/*.img.gz.sha256 \
+            "${GITHUB_WORKSPACE}/pantherx2-openwrt-validation.txt" \
+            "${GITHUB_WORKSPACE}/pantherx2-bsp-manifest.txt" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "Panther X2 OpenWrt BSP 6.1 build ${GITHUB_RUN_NUMBER}" \
+            --notes "Panther X2 OpenWrt image using the pinned Rockchip BSP 6.1.115 kernel, current accelerator/USB DTB, and current Radxa U-Boot build."
