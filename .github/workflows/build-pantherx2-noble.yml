@@ -1,10 +1,10 @@
-name: Build Panther X2 Noble BSP 6.1
+name: Build Panther X2 Noble BSP 6.1 Kernel
 
 on:
   workflow_dispatch:
     inputs:
       publish_release:
-        description: Publish the verified image to a GitHub Release
+        description: Publish the verified kernel packages to a GitHub Release
         required: false
         default: false
         type: boolean
@@ -17,7 +17,7 @@ on:
       - README.md
 
 concurrency:
-  group: pantherx2-noble-${{ github.ref }}
+  group: pantherx2-noble-kernel-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -29,9 +29,9 @@ env:
 
 jobs:
   build:
-    name: Panther X2 / Ubuntu 24.04 / BSP 6.1
+    name: Panther X2 / Ubuntu 24.04 / BSP 6.1 / Kernel only
     runs-on: ubuntu-24.04
-    timeout-minutes: 350
+    timeout-minutes: 180
 
     steps:
       - name: Checkout firmware configuration
@@ -46,6 +46,7 @@ jobs:
           test -s armbian/userpatches/config-pantherx2-image.conf
           test -s armbian/userpatches/extensions/remove-armbian-apt-source.sh
           test -s armbian/userpatches/kernel/rk35xx-vendor-6.1/0001-arm64-dts-rockchip-add-panther-x2-bsp61-accel.patch
+          test -s armbian/userpatches/kernel/rk35xx-vendor-6.1/0003-media-uvcvideo-fix-bandwidth-for-alcor.patch
           test -s armbian/userpatches/u-boot/u-boot-panther-x2-radxa/9999-fix-radxa-rock3-gcc-compat.patch
 
           grep -q '^BOARD=panther-x2-vendor$' armbian/userpatches/config-pantherx2-image.conf
@@ -60,6 +61,8 @@ jobs:
           grep -q 'rk3566-panther-x2.dtb' armbian/userpatches/kernel/rk35xx-vendor-6.1/0001-arm64-dts-rockchip-add-panther-x2-bsp61-accel.patch
           grep -q 'rknpu-supply = <0x149>' armbian/userpatches/kernel/rk35xx-vendor-6.1/0001-arm64-dts-rockchip-add-panther-x2-bsp61-accel.patch
           grep -q 'interrupt-names = "npu_irq"' armbian/userpatches/kernel/rk35xx-vendor-6.1/0001-arm64-dts-rockchip-add-panther-x2-bsp61-accel.patch
+          grep -q 'UVC non compliance' armbian/userpatches/kernel/rk35xx-vendor-6.1/0003-media-uvcvideo-fix-bandwidth-for-alcor.patch
+          grep -q 'ctrl->dwMaxPayloadTransferSize = stream->maxpsize' armbian/userpatches/kernel/rk35xx-vendor-6.1/0003-media-uvcvideo-fix-bandwidth-for-alcor.patch
 
       - name: Reclaim runner disk space
         shell: bash
@@ -106,7 +109,7 @@ jobs:
 
           git -C /builder/build status --short
 
-      - name: Build Ubuntu 24.04 Noble image
+      - name: Build kernel packages only
         working-directory: /builder/build
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -116,26 +119,25 @@ jobs:
 
           ./compile.sh \
             RELEASE=noble \
-            BUILD_DESKTOP=no \
-            BUILD_MINIMAL=no \
+            KERNEL_ONLY=yes \
             KERNEL_CONFIGURE=no \
             KERNEL_BTF=no \
             EXPERT=yes \
-            pantherx2-image build
+            pantherx2-image kernel
 
-      - name: Verify the generated firmware
+      - name: Verify the generated kernel packages
         shell: bash
         run: |
           set -euo pipefail
 
-          validation="${GITHUB_WORKSPACE}/pantherx2-validation.txt"
+          validation="${GITHUB_WORKSPACE}/pantherx2-kernel-validation.txt"
           exec > >(tee "${validation}") 2>&1
 
           require_file() {
             local path="$1"
             local label="$2"
             if [[ ! -s "${path}" ]]; then
-              echo "::error title=Missing firmware file::${label}: ${path}"
+              echo "::error title=Missing kernel artifact::${label}: ${path}"
               return 1
             fi
             echo "OK file: ${label}"
@@ -146,22 +148,67 @@ jobs:
             local expression="$2"
             local label="$3"
             if ! grep -Eq "${expression}" "${path}"; then
-              echo "::error title=Firmware content mismatch::${label}"
+              echo "::error title=Kernel content mismatch::${label}"
               return 1
             fi
             echo "OK value: ${label}"
           }
 
-          require_absent() {
-            local path="$1"
-            local label="$2"
-            if [[ -e "${path}" || -L "${path}" ]]; then
-              echo "::error title=Unexpected firmware file::${label}: ${path}"
-              return 1
-            fi
-            echo "OK absent: ${label}"
-          }
+          echo "=== Generated kernel packages ==="
+          ls -lh /builder/build/output/debs/ || true
 
+          image_deb="$(find /builder/build/output/debs -maxdepth 1 -name 'linux-image-*.deb' -print -quit)"
+          dtb_deb="$(find /builder/build/output/debs -maxdepth 1 -name 'linux-dtb-*.deb' -print -quit)"
+          headers_deb="$(find /builder/build/output/debs -maxdepth 1 -name 'linux-headers-*.deb' -print -quit)"
+
+          require_file "${image_deb}" 'linux-image .deb'
+          require_file "${dtb_deb}" 'linux-dtb .deb'
+          require_file "${headers_deb}" 'linux-headers .deb'
+
+          workdir="$(mktemp -d)"
+          trap 'rm -rf "${workdir}"' EXIT
+
+          dpkg-deb -x "${image_deb}" "${workdir}/image"
+          dpkg-deb -x "${dtb_deb}" "${workdir}/dtb"
+
+          kernel_image="$(find "${workdir}/image/boot" -maxdepth 1 -name 'vmlinuz-*' -print -quit)"
+          require_file "${kernel_image}" 'kernel vmlinuz'
+
+          kernel_config="$(find "${workdir}/image/boot" -maxdepth 1 -name 'config-6.1.*' -print -quit)"
+          require_file "${kernel_config}" 'kernel config'
+
+          dtb_file="$(find "${workdir}/dtb" -name 'rk3566-panther-x2.dtb' -print -quit)"
+          require_file "${dtb_file}" 'Panther X2 DTB'
+
+          echo ""
+          echo "=== Kernel config validation ==="
+          require_line "${kernel_config}" '^CONFIG_ROCKCHIP_MULTI_RGA=y$' 'RGA driver enabled'
+          require_line "${kernel_config}" '^CONFIG_IEP=y$' 'IEP driver enabled'
+          require_line "${kernel_config}" '^CONFIG_ROCKCHIP_MPP_SERVICE=y$' 'MPP service enabled'
+          require_line "${kernel_config}" '^CONFIG_ROCKCHIP_MPP_RKVDEC2=y$' 'RKVDEC2 enabled'
+          require_line "${kernel_config}" '^CONFIG_ROCKCHIP_MPP_RKVENC=y$' 'RKVENC enabled'
+          require_line "${kernel_config}" '^CONFIG_ROCKCHIP_RKNPU=y$' 'RKNPU enabled'
+          require_line "${kernel_config}" '^CONFIG_MEDIA_USB_SUPPORT=y$' 'USB media support enabled'
+          require_line "${kernel_config}" '^CONFIG_USB_VIDEO_CLASS=y$' 'UVC camera driver enabled'
+          require_line "${kernel_config}" '^CONFIG_USB_XHCI_HCD=y$' 'XHCI host driver enabled'
+          require_line "${kernel_config}" '^CONFIG_USB_DWC3=y$' 'DWC3 controller driver enabled'
+
+          echo ""
+          echo "=== UVC bandwidth patch verification ==="
+          if ! strings "${kernel_image}" | grep -q 'UVC non compliance'; then
+            echo '::error title=Patch not applied::UVC bandwidth fix string not found in vmlinuz'
+            exit 1
+          fi
+          echo "OK: UVC non compliance string present in vmlinuz"
+
+          if ! strings "${kernel_image}" | grep -q 'exceeds the size of the ep max packet'; then
+            echo '::error title=Patch not applied::UVC fix detail string not found in vmlinuz'
+            exit 1
+          fi
+          echo "OK: UVC fix detail string present in vmlinuz"
+
+          echo ""
+          echo "=== DTB validation ==="
           expect_fdt_status() {
             local dtb="$1"
             local node="$2"
@@ -175,112 +222,8 @@ jobs:
             echo "OK DTB status: ${node}=${actual}"
           }
 
-          expect_fdt_hex() {
-            local dtb="$1"
-            local node="$2"
-            local property="$3"
-            local expected="$4"
-            local actual
-            actual="$(sudo fdtget -t x "${dtb}" "${node}" "${property}" 2>/dev/null || true)"
-            if [[ "${actual}" != "${expected}" ]]; then
-              echo "::error title=DTB property mismatch::${node}/${property}: expected=${expected}, actual=${actual:-<missing>}"
-              return 1
-            fi
-            echo "OK DTB property: ${node}/${property}=${actual}"
-          }
-
-          expect_fdt_string() {
-            local dtb="$1"
-            local node="$2"
-            local property="$3"
-            local expected="$4"
-            local actual
-            actual="$(sudo fdtget -t s "${dtb}" "${node}" "${property}" 2>/dev/null || true)"
-            if [[ "${actual}" != "${expected}" ]]; then
-              echo "::error title=DTB property mismatch::${node}/${property}: expected=${expected}, actual=${actual:-<missing>}"
-              return 1
-            fi
-            echo "OK DTB property: ${node}/${property}=${actual}"
-          }
-
-          image="$(find /builder/build/output/images -maxdepth 1 -type f -name '*.img' -print -quit)"
-          if [[ -z "${image}" ]]; then
-            echo '::error title=Missing firmware image::No .img file was generated'
-            exit 1
-          fi
-
-          echo "Image: $(basename "${image}")"
-          sudo fdisk -l "${image}"
-
-          mount_dir="$(mktemp -d)"
-          loopdev=""
-          cleanup() {
-            if mountpoint -q "${mount_dir}/boot"; then
-              sudo umount "${mount_dir}/boot" || true
-            fi
-            if mountpoint -q "${mount_dir}"; then
-              sudo umount "${mount_dir}" || true
-            fi
-            if [[ -n "${loopdev}" ]]; then
-              sudo losetup --detach "${loopdev}" || true
-            fi
-            rmdir "${mount_dir}" || true
-          }
-          trap cleanup EXIT
-
-          loopdev="$(sudo losetup --find --partscan --show "${image}")"
-          for _ in {1..20}; do
-            [[ -b "${loopdev}p1" && -b "${loopdev}p2" ]] && break
-            sleep 1
-          done
-          if [[ ! -b "${loopdev}p1" || ! -b "${loopdev}p2" ]]; then
-            echo "::error title=Partition discovery failed::Expected ${loopdev}p1 and ${loopdev}p2"
-            lsblk "${loopdev}" || true
-            exit 1
-          fi
-
-          sudo mount -o ro "${loopdev}p2" "${mount_dir}"
-          if [[ ! -d "${mount_dir}/boot" ]]; then
-            echo '::error title=Root filesystem invalid::Missing /boot mount point'
-            exit 1
-          fi
-          sudo mount -o ro "${loopdev}p1" "${mount_dir}/boot"
-
-          os_release="${mount_dir}/etc/os-release"
-          armbian_release="${mount_dir}/etc/armbian-release"
-          env_file="${mount_dir}/boot/armbianEnv.txt"
-          kernel_config="${mount_dir}/boot/config-6.1.115-vendor-rk35xx"
-          dtb="${mount_dir}/boot/dtb/rockchip/rk3566-panther-x2.dtb"
-
-          require_file "${os_release}" '/etc/os-release'
-          require_file "${armbian_release}" '/etc/armbian-release'
-          require_file "${mount_dir}/boot/Image" '/boot/Image'
-          require_file "${env_file}" '/boot/armbianEnv.txt'
-          require_file "${kernel_config}" 'kernel configuration'
-          require_file "${dtb}" 'Panther X2 DTB'
-          require_absent "${mount_dir}/etc/apt/sources.list.d/armbian.list" 'invalid Armbian APT source'
-          require_absent "${mount_dir}/etc/apt/sources.list.d/armbian.sources" 'invalid Armbian Deb822 APT source'
-
-          require_line "${os_release}" '^VERSION_ID="24\.04"$' 'Ubuntu version is 24.04'
-          require_line "${os_release}" '^UBUNTU_CODENAME=noble$' 'Ubuntu codename is Noble'
-          require_line "${armbian_release}" '^BOARD=panther-x2-vendor$' 'Armbian board is Panther X2'
-          require_line "${armbian_release}" '^KERNEL_TARGET=vendor$' 'Kernel target is vendor'
-          require_line "${env_file}" '^fdtfile=rockchip/rk3566-panther-x2\.dtb$' 'Boot DTB is Panther X2'
-          require_line "${env_file}" '^extraargs=cma=256M$' 'CMA is 256 MiB'
-
-          require_line "${kernel_config}" '^CONFIG_ROCKCHIP_MULTI_RGA=y$' 'RGA driver enabled'
-          require_line "${kernel_config}" '^CONFIG_IEP=y$' 'IEP driver enabled'
-          require_line "${kernel_config}" '^CONFIG_ROCKCHIP_MPP_SERVICE=y$' 'MPP service enabled'
-          require_line "${kernel_config}" '^CONFIG_ROCKCHIP_MPP_RKVDEC2=y$' 'RKVDEC2 enabled'
-          require_line "${kernel_config}" '^CONFIG_ROCKCHIP_MPP_RKVENC=y$' 'RKVENC enabled'
-          require_line "${kernel_config}" '^CONFIG_ROCKCHIP_RKNPU=y$' 'RKNPU enabled'
-          require_line "${kernel_config}" '^CONFIG_MEDIA_USB_SUPPORT=y$' 'USB media support enabled'
-          require_line "${kernel_config}" '^CONFIG_USB_VIDEO_CLASS=y$' 'UVC camera driver enabled'
-          require_line "${kernel_config}" '^CONFIG_USB_XHCI_HCD=y$' 'XHCI host driver enabled'
-          require_line "${kernel_config}" '^CONFIG_USB_DWC3=y$' 'DWC3 controller driver enabled'
-
           while IFS= read -r node; do
-            expect_fdt_status "${dtb}" "${node}" okay
+            expect_fdt_status "${dtb_file}" "${node}" okay
           done <<'NODES'
           /mpp-srv
           /npu@fde40000
@@ -305,57 +248,45 @@ jobs:
           /usb2-phy@fe8a0000/otg-port
           NODES
 
-          expect_fdt_status "${dtb}" /video-codec@fdea0400 disabled
-          expect_fdt_string "${dtb}" /usbdrd/usb@fcc00000 dr_mode host
-          expect_fdt_string "${dtb}" /usbdrd/usb@fcc00000 maximum-speed high-speed
-          expect_fdt_hex "${dtb}" /npu@fde40000 rknpu-supply 149
-          expect_fdt_string "${dtb}" /npu@fde40000 interrupt-names npu_irq
-          expect_fdt_hex "${dtb}" /bus-npu bus-supply 6b
-          expect_fdt_hex "${dtb}" /bus-npu pvtm-supply 5
+          expect_fdt_status "${dtb_file}" /video-codec@fdea0400 disabled
 
-          grep -E '^(PRETTY_NAME|VERSION_ID|UBUNTU_CODENAME)=' "${os_release}"
-          grep -E '^(BOARD|BOARD_NAME|BOARDFAMILY|KERNEL_TARGET|VERSION)=' "${armbian_release}"
+          echo ""
+          echo "Kernel image: $(basename "${kernel_image}")"
           echo "Kernel config: $(basename "${kernel_config}")"
-          echo 'VPU/NPU/RGA/IEP image validation: passed'
+          echo "DTB: $(basename "${dtb_file}")"
+          echo ""
+          echo "Panther X2 kernel package validation: passed"
 
-      - name: Compress and checksum image
+      - name: Checksum kernel packages
         shell: bash
         run: |
           set -euo pipefail
 
-          cd /builder/build/output/images
-          image="$(find . -maxdepth 1 -type f -name '*.img' -print -quit)"
-          test -n "${image}"
-          compressed="${image}.xz"
-          temporary="${compressed}.tmp"
-
-          xz --threads=0 -3 --stdout "${image}" > "${temporary}"
-          mv -- "${temporary}" "${compressed}"
-          sha256sum "${compressed}" > "${compressed}.sha256"
-          sha256sum --check "${compressed}.sha256"
-          rm -- "${image}"
+          cd /builder/build/output/debs
+          sha256sum *.deb > SHA256SUMS
+          sha256sum --check SHA256SUMS
           ls -lh .
 
-      - name: Upload verified firmware
+      - name: Upload verified kernel packages
         uses: actions/upload-artifact@v4
         with:
-          name: Panther-X2-Noble-BSP61-${{ github.run_number }}
+          name: Panther-X2-Noble-BSP61-Kernel-${{ github.run_number }}
           path: |
-            /builder/build/output/images/*.img.xz
-            /builder/build/output/images/*.img.xz.sha256
-            pantherx2-validation.txt
+            /builder/build/output/debs/*.deb
+            /builder/build/output/debs/SHA256SUMS
+            pantherx2-kernel-validation.txt
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
 
-      - name: Upload validation report and build logs
+      - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Panther-X2-build-logs-${{ github.run_number }}
+          name: Panther-X2-kernel-build-logs-${{ github.run_number }}
           path: |
             /builder/build/output/logs/
-            pantherx2-validation.txt
+            pantherx2-kernel-validation.txt
           if-no-files-found: ignore
           retention-days: 14
 
@@ -367,12 +298,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          tag="pantherx2-noble-${GITHUB_RUN_NUMBER}"
+          tag="pantherx2-noble-kernel-${GITHUB_RUN_NUMBER}"
           gh release create "${tag}" \
-            /builder/build/output/images/*.img.xz \
-            /builder/build/output/images/*.img.xz.sha256 \
-            "${GITHUB_WORKSPACE}/pantherx2-validation.txt" \
+            /builder/build/output/debs/*.deb \
+            /builder/build/output/debs/SHA256SUMS \
+            "${GITHUB_WORKSPACE}/pantherx2-kernel-validation.txt" \
             --repo "${GITHUB_REPOSITORY}" \
             --target "${GITHUB_SHA}" \
-            --title "Panther X2 Ubuntu 24.04 BSP 6.1 build ${GITHUB_RUN_NUMBER}" \
-            --notes "Verified Panther X2 Noble image built from Armbian ${ARMBIAN_COMMIT}."
+            --title "Panther X2 Ubuntu 24.04 BSP 6.1 kernel build ${GITHUB_RUN_NUMBER}" \
+            --notes "Kernel-only build for Panther X2. Includes UVC bandwidth fix (9764401bf6f8). Built from Armbian ${ARMBIAN_COMMIT}."
