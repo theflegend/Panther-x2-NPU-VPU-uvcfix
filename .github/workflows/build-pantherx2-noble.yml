@@ -46,7 +46,6 @@ jobs:
           test -s armbian/userpatches/config-pantherx2-image.conf
           test -s armbian/userpatches/extensions/remove-armbian-apt-source.sh
           test -s armbian/userpatches/kernel/rk35xx-vendor-6.1/0001-arm64-dts-rockchip-add-panther-x2-bsp61-accel.patch
-          test -s armbian/userpatches/kernel/rk35xx-vendor-6.1/0002-media-uvcvideo-undup-use-uvc-endpoint-max-bpi.patch
           test -s armbian/userpatches/kernel/rk35xx-vendor-6.1/0003-media-uvcvideo-fix-bandwidth-for-alcor.patch
           test -s armbian/userpatches/u-boot/u-boot-panther-x2-radxa/9999-fix-radxa-rock3-gcc-compat.patch
 
@@ -62,8 +61,6 @@ jobs:
           grep -q 'rk3566-panther-x2.dtb' armbian/userpatches/kernel/rk35xx-vendor-6.1/0001-arm64-dts-rockchip-add-panther-x2-bsp61-accel.patch
           grep -q 'rknpu-supply = <0x149>' armbian/userpatches/kernel/rk35xx-vendor-6.1/0001-arm64-dts-rockchip-add-panther-x2-bsp61-accel.patch
           grep -q 'interrupt-names = "npu_irq"' armbian/userpatches/kernel/rk35xx-vendor-6.1/0001-arm64-dts-rockchip-add-panther-x2-bsp61-accel.patch
-
-          grep -q 'uvc_endpoint_max_bpi' armbian/userpatches/kernel/rk35xx-vendor-6.1/0002-media-uvcvideo-undup-use-uvc-endpoint-max-bpi.patch
           grep -q 'UVC non compliance' armbian/userpatches/kernel/rk35xx-vendor-6.1/0003-media-uvcvideo-fix-bandwidth-for-alcor.patch
 
       - name: Reclaim runner disk space
