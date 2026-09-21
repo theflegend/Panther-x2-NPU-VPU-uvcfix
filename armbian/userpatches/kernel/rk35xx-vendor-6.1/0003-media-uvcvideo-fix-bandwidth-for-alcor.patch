@@ -31,7 +31,7 @@ index e3567aeb0007c..11769a1832d2b 100644
  		ctrl->dwMaxPayloadTransferSize = bandwidth;
  	}
 +
-+	if (stream->intf->num_altsetting > 1 &&
++	if (stream->intf->num_altsetting >= 1 &&
 +	    ctrl->dwMaxPayloadTransferSize > stream->maxpsize) {
 +		dev_warn_ratelimited(&stream->intf->dev,
 +				     "UVC non compliance: the max payload transmission size (%u) exceeds the size of the ep max packet (%u). Using the max size.\n",
