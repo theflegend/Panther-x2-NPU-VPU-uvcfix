@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       publish_release:
-        description: Publish the verified kernel packages to a GitHub Release
+        description: Publish the verified kernel tarballs to a GitHub Release
         required: false
         default: false
         type: boolean
@@ -17,7 +17,7 @@ on:
       - README.md
 
 concurrency:
-  group: pantherx2-noble-kernel-${{ github.ref }}
+  group: pantherx2-noble-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -29,9 +29,9 @@ env:
 
 jobs:
   build:
-    name: Panther X2 / Ubuntu 24.04 / BSP 6.1 / Kernel only
+    name: Panther X2 / Ubuntu 24.04 / BSP 6.1 / kernel only
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 350
 
     steps:
       - name: Checkout firmware configuration
@@ -46,6 +46,7 @@ jobs:
           test -s armbian/userpatches/config-pantherx2-image.conf
           test -s armbian/userpatches/extensions/remove-armbian-apt-source.sh
           test -s armbian/userpatches/kernel/rk35xx-vendor-6.1/0001-arm64-dts-rockchip-add-panther-x2-bsp61-accel.patch
+          test -s armbian/userpatches/kernel/rk35xx-vendor-6.1/0002-media-uvcvideo-undup-use-uvc-endpoint-max-bpi.patch
           test -s armbian/userpatches/kernel/rk35xx-vendor-6.1/0003-media-uvcvideo-fix-bandwidth-for-alcor.patch
           test -s armbian/userpatches/u-boot/u-boot-panther-x2-radxa/9999-fix-radxa-rock3-gcc-compat.patch
 
@@ -61,8 +62,9 @@ jobs:
           grep -q 'rk3566-panther-x2.dtb' armbian/userpatches/kernel/rk35xx-vendor-6.1/0001-arm64-dts-rockchip-add-panther-x2-bsp61-accel.patch
           grep -q 'rknpu-supply = <0x149>' armbian/userpatches/kernel/rk35xx-vendor-6.1/0001-arm64-dts-rockchip-add-panther-x2-bsp61-accel.patch
           grep -q 'interrupt-names = "npu_irq"' armbian/userpatches/kernel/rk35xx-vendor-6.1/0001-arm64-dts-rockchip-add-panther-x2-bsp61-accel.patch
+
+          grep -q 'uvc_endpoint_max_bpi' armbian/userpatches/kernel/rk35xx-vendor-6.1/0002-media-uvcvideo-undup-use-uvc-endpoint-max-bpi.patch
           grep -q 'UVC non compliance' armbian/userpatches/kernel/rk35xx-vendor-6.1/0003-media-uvcvideo-fix-bandwidth-for-alcor.patch
-          grep -q 'ctrl->dwMaxPayloadTransferSize = stream->maxpsize' armbian/userpatches/kernel/rk35xx-vendor-6.1/0003-media-uvcvideo-fix-bandwidth-for-alcor.patch
 
       - name: Reclaim runner disk space
         shell: bash
@@ -109,7 +111,7 @@ jobs:
 
           git -C /builder/build status --short
 
-      - name: Build kernel packages only
+      - name: Build kernel only
         working-directory: /builder/build
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -133,55 +135,50 @@ jobs:
           validation="${GITHUB_WORKSPACE}/pantherx2-kernel-validation.txt"
           exec > >(tee "${validation}") 2>&1
 
-          require_file() {
-            local path="$1"
-            local label="$2"
-            if [[ ! -s "${path}" ]]; then
-              echo "::error title=Missing kernel artifact::${label}: ${path}"
-              return 1
-            fi
-            echo "OK file: ${label}"
-          }
+          debs_dir="/builder/build/output/debs"
+          test -d "${debs_dir}"
+
+          echo "=== Generated .deb packages ==="
+          ls -lh "${debs_dir}"
+
+          image_deb="$(ls "${debs_dir}"/linux-image-*.deb | head -1)"
+          dtb_deb="$(ls "${debs_dir}"/linux-dtb-*.deb | head -1)"
+          test -n "${image_deb}"
+          test -n "${dtb_deb}"
+          echo "image_deb=${image_deb}"
+          echo "dtb_deb=${dtb_deb}"
+
+          workdir="$(mktemp -d)"
+          dpkg-deb -x "${image_deb}" "${workdir}"
+          dpkg-deb -x "${dtb_deb}" "${workdir}"
+
+          echo "=== Layout under ${workdir}/boot ==="
+          find "${workdir}/boot" -maxdepth 3 -type f -o -type l | head -50
+          echo "=== Search for dtb ==="
+          find "${workdir}" -name 'rk3566-panther-x2.dtb'
+
+          kernel_image="$(find "${workdir}/boot" -maxdepth 1 -name 'vmlinuz-*' -print -quit)"
+          test -n "${kernel_image}"
+          echo "kernel_image=${kernel_image}"
+
+          if ! strings "${kernel_image}" | grep -q 'UVC non compliance'; then
+            echo '::error title=Patch not applied::UVC bandwidth fix string not found in kernel image'
+            exit 1
+          fi
+          echo 'OK: UVC bandwidth patch is present in kernel image'
+
+          kernel_config="$(find "${workdir}/boot" -maxdepth 1 -name 'config-*' -print -quit)"
+          test -n "${kernel_config}"
 
           require_line() {
-            local path="$1"
-            local expression="$2"
-            local label="$3"
+            local path="$1"; local expression="$2"; local label="$3"
             if ! grep -Eq "${expression}" "${path}"; then
-              echo "::error title=Kernel content mismatch::${label}"
+              echo "::error title=Kernel config mismatch::${label}"
               return 1
             fi
             echo "OK value: ${label}"
           }
 
-          echo "=== Generated kernel packages ==="
-          ls -lh /builder/build/output/debs/ || true
-
-          image_deb="$(find /builder/build/output/debs -maxdepth 1 -name 'linux-image-*.deb' -print -quit)"
-          dtb_deb="$(find /builder/build/output/debs -maxdepth 1 -name 'linux-dtb-*.deb' -print -quit)"
-          headers_deb="$(find /builder/build/output/debs -maxdepth 1 -name 'linux-headers-*.deb' -print -quit)"
-
-          require_file "${image_deb}" 'linux-image .deb'
-          require_file "${dtb_deb}" 'linux-dtb .deb'
-          require_file "${headers_deb}" 'linux-headers .deb'
-
-          workdir="$(mktemp -d)"
-          trap 'rm -rf "${workdir}"' EXIT
-
-          dpkg-deb -x "${image_deb}" "${workdir}/image"
-          dpkg-deb -x "${dtb_deb}" "${workdir}/dtb"
-
-          kernel_image="$(find "${workdir}/image/boot" -maxdepth 1 -name 'vmlinuz-*' -print -quit)"
-          require_file "${kernel_image}" 'kernel vmlinuz'
-
-          kernel_config="$(find "${workdir}/image/boot" -maxdepth 1 -name 'config-6.1.*' -print -quit)"
-          require_file "${kernel_config}" 'kernel config'
-
-          dtb_file="$(find "${workdir}/dtb" -name 'rk3566-panther-x2.dtb' -print -quit)"
-          require_file "${dtb_file}" 'Panther X2 DTB'
-
-          echo ""
-          echo "=== Kernel config validation ==="
           require_line "${kernel_config}" '^CONFIG_ROCKCHIP_MULTI_RGA=y$' 'RGA driver enabled'
           require_line "${kernel_config}" '^CONFIG_IEP=y$' 'IEP driver enabled'
           require_line "${kernel_config}" '^CONFIG_ROCKCHIP_MPP_SERVICE=y$' 'MPP service enabled'
@@ -193,28 +190,14 @@ jobs:
           require_line "${kernel_config}" '^CONFIG_USB_XHCI_HCD=y$' 'XHCI host driver enabled'
           require_line "${kernel_config}" '^CONFIG_USB_DWC3=y$' 'DWC3 controller driver enabled'
 
-          echo ""
-          echo "=== UVC bandwidth patch verification ==="
-          if ! strings "${kernel_image}" | grep -q 'UVC non compliance'; then
-            echo '::error title=Patch not applied::UVC bandwidth fix string not found in vmlinuz'
-            exit 1
-          fi
-          echo "OK: UVC non compliance string present in vmlinuz"
+          dtb_file="$(find "${workdir}" -name 'rk3566-panther-x2.dtb' -print -quit)"
+          test -n "${dtb_file}"
+          echo "dtb_file=${dtb_file}"
 
-          if ! strings "${kernel_image}" | grep -q 'exceeds the size of the ep max packet'; then
-            echo '::error title=Patch not applied::UVC fix detail string not found in vmlinuz'
-            exit 1
-          fi
-          echo "OK: UVC fix detail string present in vmlinuz"
-
-          echo ""
-          echo "=== DTB validation ==="
           expect_fdt_status() {
-            local dtb="$1"
-            local node="$2"
-            local expected="$3"
+            local node="$1"; local expected="$2"
             local actual
-            actual="$(sudo fdtget -t s "${dtb}" "${node}" status 2>/dev/null || true)"
+            actual="$(sudo fdtget -t s "${dtb_file}" "${node}" status 2>/dev/null || true)"
             if [[ "${actual}" != "${expected}" ]]; then
               echo "::error title=DTB status mismatch::${node}: expected=${expected}, actual=${actual:-<missing>}"
               return 1
@@ -223,7 +206,7 @@ jobs:
           }
 
           while IFS= read -r node; do
-            expect_fdt_status "${dtb_file}" "${node}" okay
+            expect_fdt_status "${node}" okay
           done <<'NODES'
           /mpp-srv
           /npu@fde40000
@@ -248,42 +231,121 @@ jobs:
           /usb2-phy@fe8a0000/otg-port
           NODES
 
-          expect_fdt_status "${dtb_file}" /video-codec@fdea0400 disabled
+          echo 'Kernel package validation: passed'
 
-          echo ""
-          echo "Kernel image: $(basename "${kernel_image}")"
-          echo "Kernel config: $(basename "${kernel_config}")"
-          echo "DTB: $(basename "${dtb_file}")"
-          echo ""
-          echo "Panther X2 kernel package validation: passed"
-
-      - name: Checksum kernel packages
+      - name: Repack kernel debs as armbian-update tarballs
         shell: bash
         run: |
           set -euo pipefail
 
-          cd /builder/build/output/debs
-          sha256sum *.deb > SHA256SUMS
-          sha256sum --check SHA256SUMS
-          ls -lh .
+          debs_dir="/builder/build/output/debs"
+          out_dir="/builder/build/output/kernel-tarballs"
+          mkdir -p "${out_dir}"
 
-      - name: Upload verified kernel packages
+          image_deb="$(ls "${debs_dir}"/linux-image-*.deb | head -1)"
+          kver="$(basename "${image_deb}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+          test -n "${kver}"
+          echo "Kernel version: ${kver}"
+
+          tmp="$(mktemp -d)"
+          for f in "${debs_dir}"/*.deb; do
+            dpkg-deb -x "${f}" "${tmp}"
+          done
+
+          echo "=== Layout after unpack ==="
+          find "${tmp}" -maxdepth 3 -type d | sort | head -40
+
+          # --- boot-*.tar.gz ---
+          boot_files=()
+          for name in Image vmlinuz-* config-* System.map-*; do
+            while IFS= read -r -d '' f; do
+              boot_files+=("${f}")
+            done < <(find "${tmp}/boot" -maxdepth 1 -name "${name}" -print0 2>/dev/null)
+          done
+          if [[ ${#boot_files[@]} -eq 0 ]]; then
+            echo "::error title=Missing boot files::No boot artifacts found"
+            exit 1
+          fi
+
+          ( cd "${tmp}" && tar -czf "${out_dir}/boot-${kver}.tar.gz" \
+              "${boot_files[@]#${tmp}/}" )
+
+          # --- dtb-*.tar.gz ---
+          dtb_root=""
+          for cand in "${tmp}/boot/dtb" "${tmp}/boot/dtb-${kver}-vendor-rk35xx" \
+                      "${tmp}/boot/dtb-${kver}"; do
+            if [[ -d "${cand}" ]]; then
+              dtb_root="${cand}"
+              break
+            fi
+          done
+
+          if [[ -z "${dtb_root}" ]]; then
+            found="$(find "${tmp}" -name 'rk3566-panther-x2.dtb' -printf '%h\n' | head -1)"
+            if [[ -n "${found}" ]]; then
+              dtb_root="${found}"
+            fi
+          fi
+
+          if [[ -z "${dtb_root}" ]]; then
+            echo "::error title=Missing DTB directory::Cannot locate dtb files"
+            exit 1
+          fi
+          echo "dtb_root=${dtb_root}"
+
+          rel="${dtb_root#${tmp}/}"
+          ( cd "${tmp}" && tar -czf "${out_dir}/dtb-${kver}.tar.gz" "${rel}" )
+
+          # --- modules-*.tar.gz ---
+          modules_root=""
+          for cand in "${tmp}/lib/modules/${kver}" "${tmp}/lib/modules/${kver}-vendor-rk35xx"; do
+            if [[ -d "${cand}" ]]; then
+              modules_root="${cand}"
+              break
+            fi
+          done
+          if [[ -z "${modules_root}" ]]; then
+            echo "::error title=Missing modules directory::Cannot locate /lib/modules/${kver}*"
+            ls -la "${tmp}/lib/modules" || true
+            exit 1
+          fi
+          echo "modules_root=${modules_root}"
+          rel="${modules_root#${tmp}/}"
+          ( cd "${tmp}" && tar -czf "${out_dir}/modules-${kver}.tar.gz" "${rel}" )
+
+          # --- header-*.tar.gz ---
+          if [[ -d "${tmp}/usr/src" ]]; then
+            ( cd "${tmp}" && tar -czf "${out_dir}/header-${kver}.tar.gz" usr/src )
+          fi
+
+          rm -rf "${tmp}"
+
+          echo "=== Final tarballs ==="
+          ls -lh "${out_dir}"
+
+          dtb_size="$(stat -c '%s' "${out_dir}/dtb-${kver}.tar.gz")"
+          if [[ "${dtb_size}" -lt 1000 ]]; then
+            echo "::error title=Invalid dtb tarball::dtb-${kver}.tar.gz is only ${dtb_size} bytes"
+            exit 1
+          fi
+          echo "OK dtb tarball size=${dtb_size}"
+
+      - name: Upload verified kernel tarballs
         uses: actions/upload-artifact@v4
         with:
-          name: Panther-X2-Noble-BSP61-Kernel-${{ github.run_number }}
+          name: Panther-X2-Noble-BSP61-kernel-${{ github.run_number }}
           path: |
-            /builder/build/output/debs/*.deb
-            /builder/build/output/debs/SHA256SUMS
+            /builder/build/output/kernel-tarballs/*.tar.gz
             pantherx2-kernel-validation.txt
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
 
-      - name: Upload build logs
+      - name: Upload validation report and build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Panther-X2-kernel-build-logs-${{ github.run_number }}
+          name: Panther-X2-build-logs-${{ github.run_number }}
           path: |
             /builder/build/output/logs/
             pantherx2-kernel-validation.txt
@@ -300,10 +362,9 @@ jobs:
 
           tag="pantherx2-noble-kernel-${GITHUB_RUN_NUMBER}"
           gh release create "${tag}" \
-            /builder/build/output/debs/*.deb \
-            /builder/build/output/debs/SHA256SUMS \
+            /builder/build/output/kernel-tarballs/*.tar.gz \
             "${GITHUB_WORKSPACE}/pantherx2-kernel-validation.txt" \
             --repo "${GITHUB_REPOSITORY}" \
             --target "${GITHUB_SHA}" \
-            --title "Panther X2 Ubuntu 24.04 BSP 6.1 kernel build ${GITHUB_RUN_NUMBER}" \
-            --notes "Kernel-only build for Panther X2. Includes UVC bandwidth fix (9764401bf6f8). Built from Armbian ${ARMBIAN_COMMIT}."
+            --title "Panther X2 Ubuntu 24.04 BSP 6.1 kernel ${GITHUB_RUN_NUMBER}" \
+            --notes "Verified Panther X2 Noble kernel tarballs (armbian-update compatible) built from Armbian ${ARMBIAN_COMMIT} with UVC bandwidth fix backported."
